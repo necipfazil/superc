@@ -788,7 +788,7 @@ class PresenceConditionManager {
 
           // pull or create the var expression
           String varName = vars.getName(i);
-          if (!varName.contains("CONFIG_")) {
+          if (!varName.startsWith("(defined CONFIG_")) {
             continue;
           }
           

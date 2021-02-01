@@ -165,46 +165,132 @@ public class SuperC extends Tool {
   //   assert(false);
   //   return null;
   // }
+  /**
+   * Take `node` as the root, and look for all paths which includes `namePath`
+   * as the subset of the path (e.g., for namePath "AB", paths like "AB", "ABX",
+   * "XAB", or "XAYBZ" are acceptable) and leads to instances of `cls`.
+   * 
+   * Push all such instances (`cls` instances that are reached by following a
+   * path that has namePath as some subset) into `instances_to_fill`.
+   * 
+   * This method can be used to search some fields in a subtree, e.g., searching
+   * for the declarator of some function.
+   * 
+   * TODO: this can be optimized by checking self instead of children
+   */
+  public <T> void followPathFindAllSuchChildren(GNode node, List<String> namePath, List<T> instances_to_fill, Class<T> cls) {
+    assert(instances_to_fill != null);
 
-    // Follow the defined path and returns the first child of type T
-    // Just ensure there is some subset along the path that matches namePath
-    // TODO: consume edge on self not children
-    public <T> T followPathFindChild(GNode node, List<String> namePath, Class<T> cls) {
-      if (namePath == null || namePath.isEmpty()) {
-        // continue with the class instance
-        for (Object o: node) {
-          if (o.getClass().equals(cls)) {
-            return (T)o;
-          }
+    if (namePath == null || namePath.isEmpty()) {
+      // continue with the class instances only
+      for (Object o: node) {
+        if (o.getClass().equals(cls)) {
+          instances_to_fill.add((T)o);
         }
-        // if not found, return null
-        return null;
+        if(o instanceof GNode) {
+          followPathFindAllSuchChildren((GNode)o, namePath, instances_to_fill, cls);
+        }
       }
-      String nextEdge = namePath.get(0);
+      
+      return;
+    }
+    String nextEdge = namePath.get(0);
+    for (Object o : node) {
+      if (o instanceof GNode) {
+        GNode child_node = (GNode)o;
+        boolean consume_edge = child_node.getName().equals(nextEdge);
+
+        if (consume_edge) {
+          namePath.remove(0);
+        }
+        
+        followPathFindAllSuchChildren(child_node, namePath, instances_to_fill, cls);
+
+        if (consume_edge) {
+          namePath.add(0, nextEdge); // restore
+        }
+      }
+    }
+  }
+
+  /**
+   * Take `node` as the root, and look for some path which includes `namePath`
+   * as the subset of the path (e.g., for namePath "AB", paths like "AB", "ABX",
+   * "XAB", or "XAYBZ" are acceptable) and leads to an instance of `cls`.
+   * 
+   * Return an instance of such `cls` (a `cls` instance that is reached by
+   * following a path that has namePath as some subset).
+   * 
+   * Different than followPathFindAllSuchChildren(), first encountered `cls`
+   * instance is returned.
+   * 
+   * This method can be used to search some fields in a subtree, e.g., searching
+   * for the declarator of some function.
+   * 
+   * TODO: this can be optimized by checking self instead of children
+   * 
+   * @param <T>
+   * @param node
+   * @param namePath
+   * @param cls
+   * @return
+   */
+  public <T> T followPathFindChild(GNode node, List<String> namePath, Class<T> cls) {
+    if (namePath == null || namePath.isEmpty()) {
+      // continue with the class instance
+      for (Object o: node) {
+        if (o.getClass().equals(cls)) {
+          return (T)o;
+        }
+      }
+      // otherwise, check for children GNodes
       for (Object o : node) {
         if (o instanceof GNode) {
           GNode child_node = (GNode)o;
-          boolean consume_edge = child_node.getName().equals(nextEdge);
-
-          if (consume_edge) {
-            namePath.remove(0);
-          }
-          
           T ret = followPathFindChild(child_node, namePath, cls);
-
-          if (consume_edge) {
-            // restore
-            namePath.add(0, nextEdge);
-          }
-
           if (ret != null) {
             return ret;
           }
         }
       }
+      // if not found, return null
       return null;
     }
+    String nextEdge = namePath.get(0);
+    for (Object o : node) {
+      if (o instanceof GNode) {
+        GNode child_node = (GNode)o;
+        boolean consume_edge = child_node.getName().equals(nextEdge);
 
+        if (consume_edge) {
+          namePath.remove(0);
+        }
+        
+        T ret = followPathFindChild(child_node, namePath, cls);
+
+        if (consume_edge) {
+          // restore
+          namePath.add(0, nextEdge);
+        }
+
+        if (ret != null) {
+          return ret;
+        }
+      }
+    }
+    return null;
+  }
+
+  public boolean isFuncStatic(GNode funcdef_node) {
+    assert(funcdef_node.getName().equals("FunctionDefinition"));
+    List<Language> languageInstances = new ArrayList<>();
+    followPathFindAllSuchChildren(funcdef_node, new LinkedList<>(Arrays.asList("FunctionPrototype")), languageInstances, Language.class);
+    for (Language l : languageInstances) {
+      if (l.getTokenText() != null && l.getTokenText().equals("static") )
+        return true;
+    }
+    return false;
+  }
   public String getFuncDeclarator(GNode funcdef_node) {
     assert(funcdef_node.getName().equals("FunctionDefinition"));
     Text t = followPathFindChild(funcdef_node, new LinkedList<>(Arrays.asList("FunctionPrototype", "FunctionDeclarator", "SimpleDeclarator")), Text.class);
@@ -296,7 +382,7 @@ public class SuperC extends Tool {
     // TODO: disabled until here
     //
 
-  public void necipAnalysis(Node root, String restrictToFile, String outputPath) {
+  public void necipAnalysis(Node root, String restrictToFile, boolean ignoreStaticFuncs, String outputPath) {
     ArrayList<GNode> funcdefs = new ArrayList<>();
     ArrayList<PresenceCondition> funcdefs_pcs = new ArrayList<>();
 
@@ -308,9 +394,16 @@ public class SuperC extends Tool {
     // TODO: validate how getNodes work, go into syntax tree representation if needed
     getNodes(root, null, funcdefs, funcdefs_pcs, "FunctionDefinition");
     
+    // To optimize the performance, check if an SMT translation was already done
+    // for a BDD. This improves the performance by a lot since the same BDD
+    // is shared for most of the time.
+    Map<BDD, Integer> bdd_smtid_mapping = new HashMap<>(); // The key is a BDD instance while the value is the index to the smt_constraints list.
+    List<String> smt_constraints = new ArrayList<>(); // list of constraints
+
     p("num of funcdefs found: "+ funcdefs.size());
-    Map<String, ArrayList<String>> funcdef_mapping = new HashMap<>();
-    
+    Map<String, ArrayList<Integer>> funcdef_mapping = new HashMap<>(); // maps funcname to the list of constraints for definitions (the constraints are indices to smt_constraints list)
+    Set<String> staticfuncs = new HashSet<>();
+
     for (int i = 0; i < funcdefs.size(); i++ ) {
       GNode funcdef = funcdefs.get(i);
       String loc = getFuncDefFile(funcdef);
@@ -319,19 +412,35 @@ public class SuperC extends Tool {
         // TODO: The content of the header files can be important in this analysis though
         continue;
       }
-
       String funcdecl = getFuncDeclarator(funcdef);
+      boolean isStatic = isFuncStatic(funcdef);
       // TODO: improve the location precision to line number since there can be multiple funcdefs
-      p("FuncDef loc: " + loc + " func: " + funcdecl);
+      p("FuncDef(static="+isStatic+") loc: " + loc + " func: " + funcdecl);
       
+      // don't keep track of static functions (as an optimization)
+      if (ignoreStaticFuncs && isStatic) {
+        p("Ignoring definition of static function.");
+        staticfuncs.add(funcdecl);
+        continue;
+      }
+
       // get SMT string of presence condition
       PresenceCondition pc =  funcdefs_pcs.get(i);
-      String pc_smt = pc.getRestricted().getSMT();
+      BDD pc_bdd = pc.getBDD();
+      Integer pc_smt_index;
+      if (bdd_smtid_mapping.get(pc_bdd) != null) {
+        pc_smt_index = bdd_smtid_mapping.get(pc_bdd);
+      } else {
+        String pc_smt = pc.getRestricted().getSMT();
+        smt_constraints.add(pc_smt);
+        pc_smt_index = smt_constraints.size() - 1;
+        bdd_smtid_mapping.put(pc_bdd, pc_smt_index);
+      }
       
       // Save the constraints in the mapping
-      ArrayList<String> constraints = funcdef_mapping.getOrDefault(funcdecl, new ArrayList<String>());
-      funcdef_mapping.putIfAbsent(funcdecl, constraints);
-      constraints.add(pc_smt);
+      ArrayList<Integer> constraints_indices = funcdef_mapping.getOrDefault(funcdecl, new ArrayList<Integer>());
+      funcdef_mapping.putIfAbsent(funcdecl, constraints_indices);
+      constraints_indices.add(pc_smt_index);
     }
 
     p("Done with function definitions analysis.");
@@ -349,7 +458,7 @@ public class SuperC extends Tool {
 
     p("num of funcalls found: "+ funcalls.size());
     
-    Map<String, ArrayList<String>> funcall_mapping = new HashMap<>();
+    Map<String, ArrayList<Integer>> funcall_mapping = new HashMap<>();
 
     for (int i = 0; i < funcalls.size(); i++ ) {
       GNode funcall = funcalls.get(i);
@@ -362,22 +471,43 @@ public class SuperC extends Tool {
       String funcid = getFuncIdentifierFromCall(funcall); // TODO: modify this
       // TODO: improve the location precision to line number since there can be multiple funcdefs
       p("Funcall loc: " + loc + " func: " + funcid);
+
+      if (ignoreStaticFuncs && staticfuncs.contains(funcid)) {
+        p("Ignoring call to static function.");
+        continue;
+      }
       
       // get SMT string of presence condition
       PresenceCondition pc =  funcalls_pcs.get(i);
-      String pc_smt = pc.getRestricted().getSMT();
+      BDD pc_bdd = pc.getBDD();
+      Integer pc_smt_index;
+      if (bdd_smtid_mapping.get(pc_bdd) != null) {
+        pc_smt_index = bdd_smtid_mapping.get(pc_bdd);
+      } else {
+        String pc_smt = pc.getRestricted().getSMT();
+        smt_constraints.add(pc_smt);
+        pc_smt_index = smt_constraints.size() - 1;
+        bdd_smtid_mapping.put(pc_bdd, pc_smt_index);
+      }
       
       // Save the constraints in the mapping
-      ArrayList<String> constraints = funcall_mapping.getOrDefault(funcid, new ArrayList<String>());
-      funcall_mapping.putIfAbsent(funcid, constraints);
-      constraints.add(pc_smt);
+      ArrayList<Integer> constraints_indices = funcall_mapping.getOrDefault(funcid, new ArrayList<Integer>());
+      funcall_mapping.putIfAbsent(funcid, constraints_indices);
+      constraints_indices.add(pc_smt_index);
     }
     p("Done with function calls analysis.");
+
+    // convert the constraints list into (index, value) mapping
+    Map<Integer, String> smt_constraints_map = new HashMap<>();
+    for (int i = 0; i < smt_constraints.size(); i ++) {
+      smt_constraints_map.put(i, smt_constraints.get(i));
+    }
     
     p("\nWriting the json file to \"" + outputPath + "\".");
     JSONObject jsonObj = new JSONObject();
     jsonObj.put("fundef", funcdef_mapping);
     jsonObj.put("funcall", funcall_mapping);
+    jsonObj.put("constraints", smt_constraints_map);
     writeJson(jsonObj, outputPath);
     p("Done writing the json file.");
   }
@@ -1460,7 +1590,7 @@ public class SuperC extends Tool {
       if (runtime.test("necip")) {
         p("Starting function analysis (v2, WIP).");
         Node root = (Node) translationUnit;
-        necipAnalysis(root, file.getName(), file.getPath()+".superc_constraints");
+        necipAnalysis(root, file.getName(), true, file.getPath()+".superc_constraints");
         p("End of function analysis (v2, WIP).");
       }
 
