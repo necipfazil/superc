@@ -36,7 +36,8 @@ import xtc.lang.cpp.Syntax.Kind;
 
 import net.sf.javabdd.BDDFactory;
 import net.sf.javabdd.BDD;
-  
+
+import com.microsoft.z3.*;
 
 /** Presence condition manager.  It abstracts away the nitty-gritty of
   * using BDDs.
@@ -741,6 +742,128 @@ class PresenceConditionManager {
      */
     public BDD getBDD() {
       return bdd;
+    }
+
+    /**
+     * Get SMT representation of the presence condition.
+     * @return SMT representation as a string.
+     */
+    public String getSMT() {
+      Context z3ctx = new Context(); // TODO: use the same context for all? keep track of symbols in the variable manager?
+      
+      // get z3 representation
+      BoolExpr z3rep = getZ3(z3ctx);
+
+      // get string representation by using a z3 solver
+      Solver s =z3ctx.mkSolver();
+      s.add(z3rep);
+      String rep = s.toString();
+
+      // TODO: close the z3 context?
+
+      return rep;
+    }
+
+    /**
+     * Get the restricted presence condition such that only the CONFIG_ prefixed 
+     * options are considered while the rest are interpreted as dont-care symbols.
+     * 
+     * @return The restricted PresenceCondition.
+     */
+    public PresenceCondition getRestricted() {
+      List<byte[]> allsat = bdd.allsat();
+
+      BDD configsOnlyBdd = bdd.getFactory().zero();
+      
+      for (byte[] oneSat: allsat) {
+        BDD subBdd = bdd.getFactory().one();
+
+        for (int i = 0; i < oneSat.length; i++) {
+          byte varVal = oneSat[i];
+
+          // if dont-care, dont add
+          if (varVal != 0 && varVal != 1) {
+            continue;
+          }
+
+          // pull or create the var expression
+          String varName = vars.getName(i);
+          if (!varName.contains("CONFIG_")) {
+            continue;
+          }
+          
+          BDD var = getVariableManager().getVariable(getVariableManager().getName(i));
+          if (varVal == 0) {
+            var = var.not();
+          }
+
+          subBdd.andWith(var);
+        
+        } // end of traversing one sat expr
+        
+        // push the one sat expr, i.e., disjunct
+        configsOnlyBdd = configsOnlyBdd.or(subBdd);
+      }
+
+      return new PresenceCondition(configsOnlyBdd);
+    }
+
+    /**
+     * Get the Z3 representation.
+     * 
+     * @param z3ctx The z3 context in which to create the z3.BoolExpr instance.
+     * @return The z3 representation of the presence condition.
+     */
+    public BoolExpr getZ3(Context z3ctx) {
+      List<byte[]> allsat = bdd.allsat();
+
+      List<BoolExpr> allSatExprList = new ArrayList<>();
+
+      Map<String, BoolExpr> exprMap = new HashMap<>();
+      Map<String, BoolExpr> negatedExprMap = new HashMap<>();
+
+      for (byte[] oneSat: allsat) {
+        List<BoolExpr> oneSatExprList = new ArrayList<>();
+
+        for (int i = 0; i < oneSat.length; i++) {
+          byte varVal = oneSat[i];
+
+          // if dont-care, dont add
+          if (varVal != 0 && varVal != 1) {
+            continue;
+          }
+
+          // pull or create the var expression
+          String varName = vars.getName(i);
+          BoolExpr varExpr = null;
+
+          varExpr = exprMap.get(varName);
+          if (varExpr == null) {
+            varExpr = z3ctx.mkBoolConst(varName);
+            exprMap.put(varName, varExpr);
+          }
+
+          if (varVal == 0) {
+            // negate
+            BoolExpr negatedVarExpr = negatedExprMap.get(varName);
+            if (negatedVarExpr == null) {
+              negatedVarExpr = z3ctx.mkNot(varExpr);
+              negatedExprMap.put(varName, negatedVarExpr);
+            }
+            varExpr = negatedVarExpr;
+          }
+          assert (varExpr != null);
+
+          // push the z3 symbol, i.e., conjunct
+          oneSatExprList.add(varExpr);
+        } // end of traversing one sat expr
+        
+        // push the one sat expr, i.e., disjunct
+        BoolExpr oneSatExpr = (BoolExpr)z3ctx.mkAnd(oneSatExprList.toArray(new BoolExpr[oneSatExprList.size()]));
+        allSatExprList.add( oneSatExpr );        
+      }
+      BoolExpr allSatExpr = (BoolExpr)z3ctx.mkOr(allSatExprList.toArray(new BoolExpr[allSatExprList.size()]));
+      return allSatExpr;
     }
 
     /**

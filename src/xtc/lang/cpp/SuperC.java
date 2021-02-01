@@ -24,6 +24,7 @@ import java.io.File;
 import java.io.Reader;
 import java.io.BufferedReader;
 import java.io.FileReader;
+import java.io.FileWriter;
 import java.io.StringReader;
 import java.io.OutputStreamWriter;
 import java.io.IOException;
@@ -71,6 +72,9 @@ import xtc.parser.Result;
 import xtc.parser.ParseException;
 
 import net.sf.javabdd.BDD;
+import net.sf.javabdd.BDDFactory;
+
+import com.microsoft.z3.*;
 
 import org.sat4j.core.VecInt;
 import org.sat4j.minisat.SolverFactory;
@@ -80,6 +84,7 @@ import org.sat4j.specs.ISolver;
 import org.sat4j.specs.TimeoutException;
 import org.sat4j.tools.ModelIterator;
 
+import org.json.simple.JSONObject;
 /**
  * The SuperC configuration-preserving preprocessor and parsing.
  *
@@ -87,6 +92,306 @@ import org.sat4j.tools.ModelIterator;
  * @version $Revision: 1.130 $
  */
 public class SuperC extends Tool {
+
+  public final static void p(String msg) {
+    System.err.println(msg);
+  }
+
+  // TODO: works on only GNode  
+  public void getNodes(Object n, PresenceCondition last_pc, List<GNode> tofill_wanted, List<PresenceCondition> tofill_pc, String wantedcls) {
+    if(n == null) return;
+    // String clsname = n.getClass().getName();
+    //p("getNodes() is processing class:" + clsname);
+    
+    if (n instanceof GNode){
+      GNode gn = (GNode)n;
+      if (gn.getName().equals(wantedcls)) {
+        tofill_wanted.add(gn);
+        tofill_pc.add(last_pc);
+      }
+      
+      // if the current object is conditional, update the last_conditional for the children nodes
+      if (gn.getName().equals("Conditional")) {
+        last_pc = getPresenceCondition(gn);
+      }
+      // traverse childiren
+      for(Object o: gn) {
+        getNodes(o, last_pc, tofill_wanted, tofill_pc, wantedcls);
+      }  
+    } 
+  }
+
+  // follow the path defined by namePath and return the node at the end of the path
+  public GNode followPath(GNode node, List<String> namePath) {
+    for (String next : namePath) {
+      boolean edgeTaken = false;
+      for (Object o : node) {
+        if (o instanceof GNode && ((GNode)o).getName().equals(next) ) {
+          node = (GNode)o;
+          edgeTaken = true;
+          break;
+        }
+      }
+      assert(edgeTaken);
+    }
+    return node;
+  }
+
+  // // Follow the defined path and returns the first child of type T
+  // public <T> T followPathFindChild(GNode node, List<String> namePath, Class<T> cls) {
+  //   p("Node: " + node.toString());
+  //   p("Namepath: " + namePath.toString());
+  //   for (String next : namePath) {
+  //     p("Looking for " + next);
+  //     boolean edgeTaken = false;
+  //     for (Object o : node) {
+  //       if (o instanceof GNode && ((GNode)o).getName().equals(next) ) {
+  //         node = (GNode)o;
+  //         edgeTaken = true;
+  //         break;
+  //       }
+  //     }
+  //     p("Edge taken: " + edgeTaken);
+      
+  //     assert(edgeTaken);
+  //   }
+
+  //   // Search for child of type T
+  //   for (Object o: node) {
+  //     if (o.getClass().equals(cls)) {
+  //       return (T)o;
+  //     }
+  //   }
+  //   assert(false);
+  //   return null;
+  // }
+
+    // Follow the defined path and returns the first child of type T
+    // Just ensure there is some subset along the path that matches namePath
+    // TODO: consume edge on self not children
+    public <T> T followPathFindChild(GNode node, List<String> namePath, Class<T> cls) {
+      if (namePath == null || namePath.isEmpty()) {
+        // continue with the class instance
+        for (Object o: node) {
+          if (o.getClass().equals(cls)) {
+            return (T)o;
+          }
+        }
+        // if not found, return null
+        return null;
+      }
+      String nextEdge = namePath.get(0);
+      for (Object o : node) {
+        if (o instanceof GNode) {
+          GNode child_node = (GNode)o;
+          boolean consume_edge = child_node.getName().equals(nextEdge);
+
+          if (consume_edge) {
+            namePath.remove(0);
+          }
+          
+          T ret = followPathFindChild(child_node, namePath, cls);
+
+          if (consume_edge) {
+            // restore
+            namePath.add(0, nextEdge);
+          }
+
+          if (ret != null) {
+            return ret;
+          }
+        }
+      }
+      return null;
+    }
+
+  public String getFuncDeclarator(GNode funcdef_node) {
+    assert(funcdef_node.getName().equals("FunctionDefinition"));
+    Text t = followPathFindChild(funcdef_node, new LinkedList<>(Arrays.asList("FunctionPrototype", "FunctionDeclarator", "SimpleDeclarator")), Text.class);
+    return t.getTokenText();
+  }
+
+  public String getFuncIdentifierFromCall(GNode funcall_node) {
+    assert(funcall_node.getName().equals("FunctionCall"));
+    Text t = followPathFindChild(funcall_node, new LinkedList<>(Arrays.asList("PrimaryIdentifier")), Text.class);
+    return t.getTokenText();
+  }
+
+  // TODO: find first with location
+  public String getFuncDefFile(GNode funcdef_node) {
+    assert(funcdef_node.getName().equals("FunctionDefinition"));
+    Text t = followPathFindChild(funcdef_node, new LinkedList<>(Arrays.asList("FunctionPrototype", "FunctionDeclarator", "SimpleDeclarator")), Text.class);
+    if (t == null || t.getLocation() == null) {
+      return "UnknownFile";
+      // TODO: this shouldn't be happenning
+    }
+    return t.getLocation().file;
+  }
+
+  public String getFuncCallFile(GNode funcall_node) {
+    assert(funcall_node.getName().equals("FunctionCall"));
+    Text t = followPathFindChild(funcall_node, new LinkedList<>(Arrays.asList("PrimaryIdentifier")), Text.class);
+    if (t == null || t.getLocation() == null) {
+      return "UnknownFile";
+      // TODO: this shouldn't be happenning
+    }
+    return t.getLocation().file;
+  }
+
+  public PresenceCondition getPresenceCondition(GNode conditional_node) {
+    assert(conditional_node.getName().equals("Conditional"));
+    for (Object o: conditional_node) {
+      if (o instanceof PresenceCondition) {
+        return (PresenceCondition)o;
+      }
+    }
+    assert(false);
+    return null;
+  }
+
+    //
+    // TODO: disabled the following
+    // this is for parsing the names etc.
+    // get all configs
+    // Set<String> all_configs = new HashSet<String>();
+    // for (int i = 0; i < funcdefs.size(); i++ ) {
+    //   GNode funcdef = funcdefs.get(i);
+    //   String loc = getFuncFile(funcdef);
+    //   if (restrictToFile != null && !loc.endsWith(restrictToFile)) {
+    //     continue;
+    //   }
+    //   String funcdecl = getFuncDeclarator(funcdef);
+    //   PresenceCondition pc =  pcs.get(i);
+    //   all_configs.addAll(pc.getAllConfigs());
+    // }
+
+    // p("all configs: " + all_configs);
+
+    // // get the non CONFIG_ prefixeds
+    // Set<String> non_configs = new HashSet<String>();
+    // for (String c : all_configs) {
+    //   if (!c.contains("CONFIG_")) {
+    //     non_configs.add(c);
+    //   }
+    // }
+
+    // Set<String> conf_prefixed = new HashSet<String>(all_configs);
+    // conf_prefixed.removeAll(non_configs);
+    // p("\n'CONFIG_' prefixed configs: " + conf_prefixed);
+    
+
+    // Pattern p = Pattern.compile("([\\!]?)\\(defined (CONFIG_[\\w]*)([^\\w]*)");
+    // Set<String> only_configname = new HashSet<String>();
+    // for (String cp : conf_prefixed) {
+    //   Matcher m = p.matcher(cp);
+    //   boolean found = m.find();
+    //   assert(found);
+    //   String configname = m.group(2);
+    //   only_configname.add(configname);
+    // }
+    // p("\n'CONFIG_' prefixed configs (config names only): " + only_configname);
+
+    // // create a bdd as simplifier
+    
+    // TODO: disabled until here
+    //
+
+  public void necipAnalysis(Node root, String restrictToFile, String outputPath) {
+    ArrayList<GNode> funcdefs = new ArrayList<>();
+    ArrayList<PresenceCondition> funcdefs_pcs = new ArrayList<>();
+
+    //
+    // Get the mapping for function definitions
+    //
+    p("\nStarting function definitions analysis..");
+    // get the function definitions and presence conditions
+    // TODO: validate how getNodes work, go into syntax tree representation if needed
+    getNodes(root, null, funcdefs, funcdefs_pcs, "FunctionDefinition");
+    
+    p("num of funcdefs found: "+ funcdefs.size());
+    Map<String, ArrayList<String>> funcdef_mapping = new HashMap<>();
+    
+    for (int i = 0; i < funcdefs.size(); i++ ) {
+      GNode funcdef = funcdefs.get(i);
+      String loc = getFuncDefFile(funcdef);
+      
+      if (restrictToFile != null && !loc.endsWith(restrictToFile)) {
+        // TODO: The content of the header files can be important in this analysis though
+        continue;
+      }
+
+      String funcdecl = getFuncDeclarator(funcdef);
+      // TODO: improve the location precision to line number since there can be multiple funcdefs
+      p("FuncDef loc: " + loc + " func: " + funcdecl);
+      
+      // get SMT string of presence condition
+      PresenceCondition pc =  funcdefs_pcs.get(i);
+      String pc_smt = pc.getRestricted().getSMT();
+      
+      // Save the constraints in the mapping
+      ArrayList<String> constraints = funcdef_mapping.getOrDefault(funcdecl, new ArrayList<String>());
+      funcdef_mapping.putIfAbsent(funcdecl, constraints);
+      constraints.add(pc_smt);
+    }
+
+    p("Done with function definitions analysis.");
+
+    //
+    // Get the mapping for function calls
+    //
+    p("\nStarting function calls analysis..");
+        
+    ArrayList<GNode> funcalls = new ArrayList<>();
+    ArrayList<PresenceCondition> funcalls_pcs= new ArrayList<>();
+
+    // get the function calls and presence conditions
+    getNodes(root, null, funcalls, funcalls_pcs, "FunctionCall");
+
+    p("num of funcalls found: "+ funcalls.size());
+    
+    Map<String, ArrayList<String>> funcall_mapping = new HashMap<>();
+
+    for (int i = 0; i < funcalls.size(); i++ ) {
+      GNode funcall = funcalls.get(i);
+      String loc = getFuncCallFile(funcall);
+      
+      if (restrictToFile != null && !loc.endsWith(restrictToFile)) {
+        continue; // TODO: The content of the header files can be important in this analysis though
+      }
+
+      String funcid = getFuncIdentifierFromCall(funcall); // TODO: modify this
+      // TODO: improve the location precision to line number since there can be multiple funcdefs
+      p("Funcall loc: " + loc + " func: " + funcid);
+      
+      // get SMT string of presence condition
+      PresenceCondition pc =  funcalls_pcs.get(i);
+      String pc_smt = pc.getRestricted().getSMT();
+      
+      // Save the constraints in the mapping
+      ArrayList<String> constraints = funcall_mapping.getOrDefault(funcid, new ArrayList<String>());
+      funcall_mapping.putIfAbsent(funcid, constraints);
+      constraints.add(pc_smt);
+    }
+    p("Done with function calls analysis.");
+    
+    p("\nWriting the json file to \"" + outputPath + "\".");
+    JSONObject jsonObj = new JSONObject();
+    jsonObj.put("fundef", funcdef_mapping);
+    jsonObj.put("funcall", funcall_mapping);
+    writeJson(jsonObj, outputPath);
+    p("Done writing the json file.");
+  }
+
+  private void writeJson(JSONObject jsonObj, String filePath) {
+    try {
+      FileWriter fr = new FileWriter(filePath);
+      jsonObj.writeJSONString(fr);
+      fr.close();
+    } catch(Exception e) {
+      p("Exception while writing file: " + e);
+    }
+  }
+
   /** The user defined include paths */
   List<String> I;
   
@@ -315,7 +620,12 @@ public class SuperC extends Tool {
            "Show lookaheads on each parse loop (warning: very voluminous "
            + "output!)").
       bool("macroTable", "macroTable", false,
-           "Show the macro symbol table.")
+           "Show the macro symbol table.").
+      bool("necip", "necip", false,
+           "Function analysis (WIP).  "
+           + "Get the restricted presence conditions for function definitions "
+           + "and function calls in the input file, and print the JSON mapping "
+           + "at \"%FILEPATH%.superc_constraints\"." )
       ;
   }
   
@@ -1144,6 +1454,14 @@ public class SuperC extends Tool {
 
       if (runtime.test("printAST")) {
         runtime.console().format((Node) translationUnit).pln().flush();
+      }
+
+      runtime.setValue("necip", true);
+      if (runtime.test("necip")) {
+        p("Starting function analysis (v2, WIP).");
+        Node root = (Node) translationUnit;
+        necipAnalysis(root, file.getName(), file.getPath()+".superc_constraints");
+        p("End of function analysis (v2, WIP).");
       }
 
       if (runtime.test("printSource")) {
